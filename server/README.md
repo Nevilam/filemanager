@@ -39,8 +39,14 @@ docker compose up --build
 - `PATCH /api/items/:id/privacy` (private/public)
 - `DELETE /api/items/:id`
 - `POST /api/items/:id/share` (получить ссылку по hex-коду)
-- `GET /api/files/:id/download`
+- `GET /api/items/:id/download` (файл напрямую, папка в `.zip`)
+- `GET /api/files/:id/download` (legacy, перенаправлено на общий download)
 - `GET /api/public/:shareCode`
 - `GET /api/public/:shareCode/download`
+
+## Публичные share-ссылки вне localhost
+
+- По умолчанию `shareUrl` строится из заголовков запроса (`Origin` / `X-Forwarded-*`).
+- Если приложение работает за прокси/доменом, можно явно задать `PUBLIC_BASE_URL`.
 
 Если существует `../frontend/dist`, сервер раздаёт фронт со страницы `/`.

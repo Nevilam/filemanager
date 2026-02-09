@@ -55,7 +55,11 @@ export const Home = (): JSX.Element => {
       navigate(`/home/cloud/${response.user.username}`);
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(err.message);
+        if (err.status === 401) {
+          setError("Неверный логин или пароль");
+        } else {
+          setError(err.message);
+        }
       } else {
         setError("Ошибка сети. Попробуйте снова");
       }

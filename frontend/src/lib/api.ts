@@ -236,8 +236,8 @@ export function shareItem(itemId: string): Promise<{ ok: boolean; shareCode: str
   );
 }
 
-export function downloadOwnFile(itemId: string, fileName: string): Promise<void> {
-  return downloadBlob(`/api/files/${itemId}/download`, fileName, true);
+export function downloadOwnItem(itemId: string, fileName: string): Promise<void> {
+  return downloadBlob(`/api/items/${itemId}/download`, fileName, true);
 }
 
 export function getPublicFile(shareCode: string): Promise<{ ok: boolean; file: PublicFile }> {

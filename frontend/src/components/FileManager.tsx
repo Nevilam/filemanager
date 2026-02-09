@@ -15,7 +15,7 @@ import {
   clearAuthToken,
   createFolder,
   deleteItem,
-  downloadOwnFile,
+  downloadOwnItem,
   listMyItems,
   renameItem,
   shareItem,
@@ -53,10 +53,7 @@ export function FileManager({ userName, onLogout }: FileManagerProps) {
     [items, selectedItemId],
   );
 
-  const selectedFile = useMemo(
-    () => (selectedItem?.type === "file" ? selectedItem : null),
-    [selectedItem],
-  );
+  const selectedFile = useMemo(() => (selectedItem?.type === "file" ? selectedItem : null), [selectedItem]);
 
   const handleApiError = useCallback(
     (err: unknown) => {
@@ -163,13 +160,10 @@ export function FileManager({ userName, onLogout }: FileManagerProps) {
     if (!selectedItem) {
       return;
     }
-    if (selectedItem.type === "folder") {
-      alert("Скачивание папок пока не поддерживается");
-      return;
-    }
 
     try {
-      await downloadOwnFile(selectedItem.id, selectedItem.name);
+      const fileName = selectedItem.type === "folder" ? `${selectedItem.name}.zip` : selectedItem.name;
+      await downloadOwnItem(selectedItem.id, fileName);
     } catch (err) {
       handleApiError(err);
     }
@@ -183,26 +177,26 @@ export function FileManager({ userName, onLogout }: FileManagerProps) {
     try {
       const response = await shareItem(selectedFile.id);
       await navigator.clipboard.writeText(response.shareUrl);
-      if (response.isPrivate) {
-        alert(`Ссылка скопирована (${response.shareCode}), но файл Private и недоступен публично.`);
-      } else {
-        alert(`Ссылка скопирована: ${response.shareUrl}`);
-      }
+      alert(`Ссылка скопирована: ${response.shareUrl}`);
     } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        alert("файл приватный, невозможно поделиться");
+        return;
+      }
       handleApiError(err);
     }
   };
 
   const handlePrivacyToggle = async () => {
-    if (!selectedFile || isUpdatingPrivacy) {
+    if (!selectedItem || isUpdatingPrivacy) {
       return;
     }
 
     try {
       setIsUpdatingPrivacy(true);
-      const nextValue = !selectedFile.isPrivate;
-      const response = await updateItemPrivacy(selectedFile.id, nextValue);
-      setItems((prev) => prev.map((item) => (item.id === selectedFile.id ? response.item : item)));
+      const nextValue = !selectedItem.isPrivate;
+      const response = await updateItemPrivacy(selectedItem.id, nextValue);
+      setItems((prev) => prev.map((item) => (item.id === selectedItem.id ? response.item : item)));
     } catch (err) {
       handleApiError(err);
     } finally {
@@ -234,14 +228,7 @@ export function FileManager({ userName, onLogout }: FileManagerProps) {
 
   const renderItemName = (item: CloudItem) => {
     if (editingItemId !== item.id) {
-      return (
-        <div className="flex items-center gap-2">
-          <span className="text-white">{item.name}</span>
-          {item.type === "file" && item.shareCode && (
-            <span className="text-[10px] text-white/70">#{item.shareCode}</span>
-          )}
-        </div>
-      );
+      return <span className="text-white">{item.name}</span>;
     }
 
     return (
@@ -317,10 +304,10 @@ export function FileManager({ userName, onLogout }: FileManagerProps) {
             </button>
           </div>
 
-          {selectedFile && (
+          {selectedItem && (
             <div className="mb-4 p-3 rounded-xl bg-white/5 border border-white/15 flex items-center justify-between gap-4">
               <div className="text-white/80 text-sm">
-                Код файла: <span className="text-white font-semibold">{selectedFile.shareCode}</span>
+                {selectedItem.type === "folder" ? "Выбрана папка" : "Выбран файл"}
               </div>
               <button
                 type="button"
@@ -335,12 +322,12 @@ export function FileManager({ userName, onLogout }: FileManagerProps) {
                 <span>Private</span>
                 <span
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    selectedFile.isPrivate ? "bg-violet-500" : "bg-emerald-500"
+                    selectedItem.isPrivate ? "bg-violet-500" : "bg-emerald-500"
                   } ${isUpdatingPrivacy ? "opacity-60" : ""}`}
                 >
                   <span
                     className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      selectedFile.isPrivate ? "translate-x-6" : "translate-x-1"
+                      selectedItem.isPrivate ? "translate-x-6" : "translate-x-1"
                     }`}
                   />
                 </span>

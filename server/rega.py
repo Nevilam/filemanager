@@ -2,6 +2,8 @@ import os
 import secrets
 import sqlite3
 import time
+import io
+import zipfile
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Optional, TypedDict
@@ -93,9 +95,7 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             (code, int(file_row[0])),
         )
 
-    conn.execute(
-        "UPDATE items SET is_private = 1 WHERE item_type = 'file' AND is_private IS NULL"
-    )
+    conn.execute("UPDATE items SET is_private = 1 WHERE is_private IS NULL")
 
 
 def init_db() -> None:
@@ -161,7 +161,7 @@ def to_item_payload(row: sqlite3.Row) -> Dict[str, Any]:
         "parentId": str(row["parent_id"]) if row["parent_id"] is not None else None,
         "size": int(row["size"] or 0),
         "shareCode": row["share_code"] if row["item_type"] == "file" else None,
-        "isPrivate": bool(row["is_private"]) if row["item_type"] == "file" else True,
+        "isPrivate": bool(row["is_private"]),
     }
 
 
@@ -178,7 +178,110 @@ def get_public_base_url() -> str:
     if origin:
         return origin
 
+    forwarded_host = request.headers.get("X-Forwarded-Host", "").strip()
+    if forwarded_host:
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").strip() or "https"
+        return f"{forwarded_proto}://{forwarded_host}"
+
     return request.host_url.rstrip("/")
+
+
+def sanitize_zip_name(name: str) -> str:
+    safe = name.strip().replace("/", "_").replace("\\", "_")
+    return safe or "item"
+
+
+def build_folder_archive(owner_id: int, folder_id: int) -> io.BytesIO:
+    conn = get_db()
+    rows = conn.execute(
+        """
+        WITH RECURSIVE tree AS (
+            SELECT id, parent_id, name, item_type, stored_name
+            FROM items
+            WHERE id = ? AND owner_id = ?
+            UNION ALL
+            SELECT i.id, i.parent_id, i.name, i.item_type, i.stored_name
+            FROM items i
+            JOIN tree t ON i.parent_id = t.id
+            WHERE i.owner_id = ?
+        )
+        SELECT id, parent_id, name, item_type, stored_name
+        FROM tree
+        """,
+        (folder_id, owner_id, owner_id),
+    ).fetchall()
+
+    rows_by_id: Dict[int, sqlite3.Row] = {int(row["id"]): row for row in rows}
+    path_cache: Dict[int, str] = {}
+
+    def build_relative_path(node_id: int) -> str:
+        cached = path_cache.get(node_id)
+        if cached is not None:
+            return cached
+
+        node = rows_by_id[node_id]
+        name = sanitize_zip_name(str(node["name"]))
+        parent_id = node["parent_id"]
+        if parent_id is None or int(parent_id) not in rows_by_id:
+            path_cache[node_id] = name
+            return name
+
+        parent_path = build_relative_path(int(parent_id))
+        full_path = f"{parent_path}/{name}"
+        path_cache[node_id] = full_path
+        return full_path
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for row in rows:
+            node_id = int(row["id"])
+            node_type = str(row["item_type"])
+            relative_path = build_relative_path(node_id)
+
+            if node_type == "folder":
+                zip_file.writestr(f"{relative_path}/", b"")
+                continue
+
+            stored_name = row["stored_name"]
+            if not stored_name:
+                continue
+
+            file_path = UPLOAD_DIR / str(stored_name)
+            if not file_path.exists() or not file_path.is_file():
+                continue
+
+            zip_file.write(file_path, arcname=relative_path)
+
+    buffer.seek(0)
+    return buffer
+
+
+def is_item_public(row: sqlite3.Row) -> bool:
+    if bool(row["is_private"]):
+        return False
+
+    conn = get_db()
+    parent_id = row["parent_id"]
+    visited: set[int] = set()
+
+    while parent_id is not None:
+        current_parent_id = int(parent_id)
+        if current_parent_id in visited:
+            return False
+        visited.add(current_parent_id)
+
+        parent_row = conn.execute(
+            "SELECT id, parent_id, is_private FROM items WHERE id = ?",
+            (current_parent_id,),
+        ).fetchone()
+        if not parent_row:
+            return False
+        if bool(parent_row["is_private"]):
+            return False
+
+        parent_id = parent_row["parent_id"]
+
+    return True
 
 
 def extract_token() -> Optional[str]:
@@ -339,7 +442,7 @@ def login():
     conn = get_db()
     user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if not user or not check_password_hash(user["password_hash"], password):
-        return make_error("Invalid username or password", 401)
+        return make_error("Неверный логин или пароль", 401)
 
     token_data = create_token(int(user["id"]))
     return jsonify(
@@ -556,9 +659,6 @@ def update_privacy(item_id: int):
     if not row:
         return make_error("Item not found", 404)
 
-    if row["item_type"] != "file":
-        return make_error("Privacy can be changed only for files", 400)
-
     conn = get_db()
     conn.execute(
         "UPDATE items SET is_private = ? WHERE id = ? AND owner_id = ?",
@@ -571,6 +671,39 @@ def update_privacy(item_id: int):
         return make_error("Item not found", 404)
 
     return jsonify({"ok": True, "item": to_item_payload(updated)})
+
+
+@app.route("/api/items/<int:item_id>/download", methods=["GET"])
+@require_auth
+def download_item(item_id: int):
+    user: AuthUser = g.current_user
+    row = get_owner_item(user["id"], item_id)
+    if not row:
+        return make_error("Item not found", 404)
+
+    if row["item_type"] == "file":
+        stored_name = row["stored_name"]
+        if not stored_name:
+            return make_error("File storage error", 500)
+
+        file_path = UPLOAD_DIR / stored_name
+        if not file_path.exists():
+            return make_error("File not found on disk", 404)
+
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=row["name"],
+            mimetype=row["mime"] or "application/octet-stream",
+        )
+
+    archive_stream = build_folder_archive(user["id"], item_id)
+    return send_file(
+        archive_stream,
+        as_attachment=True,
+        download_name=f"{sanitize_zip_name(str(row['name']))}.zip",
+        mimetype="application/zip",
+    )
 
 
 @app.route("/api/items/<int:item_id>", methods=["DELETE"])
@@ -638,6 +771,8 @@ def get_share_link(item_id: int):
         return make_error("Item not found", 404)
     if row["item_type"] != "file":
         return make_error("Share link is available only for files", 400)
+    if not is_item_public(row):
+        return make_error("файл приватный, невозможно поделиться", 403)
 
     share_code = row["share_code"]
     if not share_code:
@@ -664,25 +799,7 @@ def get_share_link(item_id: int):
 @app.route("/api/files/<int:item_id>/download", methods=["GET"])
 @require_auth
 def download_own_file(item_id: int):
-    user: AuthUser = g.current_user
-    row = get_owner_item(user["id"], item_id)
-    if not row or row["item_type"] != "file":
-        return make_error("File not found", 404)
-
-    stored_name = row["stored_name"]
-    if not stored_name:
-        return make_error("File storage error", 500)
-
-    file_path = UPLOAD_DIR / stored_name
-    if not file_path.exists():
-        return make_error("File not found on disk", 404)
-
-    return send_file(
-        file_path,
-        as_attachment=True,
-        download_name=row["name"],
-        mimetype=row["mime"] or "application/octet-stream",
-    )
+    return download_item(item_id)
 
 
 @app.route("/api/public/<share_code>", methods=["GET"])
@@ -691,7 +808,7 @@ def get_public_file(share_code: str):
     if not row:
         return make_error("File not found", 404)
 
-    if bool(row["is_private"]):
+    if not is_item_public(row):
         return make_error("This file is private", 403)
 
     return jsonify(
@@ -716,7 +833,7 @@ def download_public_file(share_code: str):
     if not row:
         return make_error("File not found", 404)
 
-    if bool(row["is_private"]):
+    if not is_item_public(row):
         return make_error("This file is private", 403)
 
     stored_name = row["stored_name"]
